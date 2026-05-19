@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""
+linuwu-fan-ctl
+──────────────
+Interface de gerenciamento para o daemon linuwu-fan-control.
+
+Uso:
+  linuwu-fan-ctl                    → abre TUI interativa
+  linuwu-fan-ctl status [--watch]   → status one-shot ou ao vivo
+  linuwu-fan-ctl get [SECTION.KEY]  → ler configuração
+  linuwu-fan-ctl set SECTION.KEY V  → atualizar parâmetro (root)
+  linuwu-fan-ctl reload             → forçar reload (SIGHUP)
+  linuwu-fan-ctl enable / disable   → ativar/desativar controle
+"""
+
+import argparse
+import curses
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from configparser import ConfigParser
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+CONFIG_PATH  = "/etc/linuwu-fan-control.conf"
+STATUS_FILE  = "/run/linuwu-fan-control.status"
+PID_FILE     = "/run/linuwu-fan-control.pid"
+STALE_SECS   = 15
+
+# ── Ordem de exibição dos parâmetros na TUI ────────────────────────────────────
+PARAM_ORDER = [
+    ("general", "enabled"),
+    ("general", "poll_interval"),
+    ("general", "ramp_step"),
+    ("general", "hysteresis"),
+    ("power",   "target_watts"),
+    ("power",   "curve"),
+    ("cpu_temp","curve"),
+    ("gpu_temp","curve"),
+    ("limits",  "cpu_fan_min"),
+    ("limits",  "cpu_fan_max"),
+    ("limits",  "gpu_fan_min"),
+    ("limits",  "gpu_fan_max"),
+]
+
+
+# ── Validação ──────────────────────────────────────────────────────────────────
+
+def _validate_curve(v):
+    pairs = [t.strip() for t in v.split(",") if ":" in t.strip()]
+    if not pairs:
+        return False
+    for p in pairs:
+        x, y = p.split(":", 1)
+        float(x.strip())
+        float(y.strip())
+    return True
+
+
+SCHEMA = {
+    "general.enabled":       (lambda v: v.lower() in ("true", "false", "yes", "no", "1", "0"),
+                              "bool (true/false)"),
+    "general.poll_interval": (lambda v: float(v) > 0,           "float positivo (segundos)"),
+    "general.ramp_step":     (lambda v: 0 < float(v) <= 100,    "float 0–100"),
+    "general.hysteresis":    (lambda v: 0 <= float(v) < 100,    "float 0–99"),
+    "power.target_watts":    (lambda v: float(v) >= 0,          "float >= 0 (watts)"),
+    "power.curve":           (_validate_curve,                  "curva ex: '15:15, 35:40, 80:90'"),
+    "cpu_temp.curve":        (_validate_curve,                  "curva ex: '45:20, 65:50, 85:90'"),
+    "gpu_temp.curve":        (_validate_curve,                  "curva ex: '45:20, 65:50, 85:90'"),
+    "limits.cpu_fan_min":    (lambda v: 0 <= float(v) <= 100,   "float 0–100"),
+    "limits.cpu_fan_max":    (lambda v: 0 <= float(v) <= 100,   "float 0–100"),
+    "limits.gpu_fan_min":    (lambda v: 0 <= float(v) <= 100,   "float 0–100"),
+    "limits.gpu_fan_max":    (lambda v: 0 <= float(v) <= 100,   "float 0–100"),
+}
+
+
+def validate_value(section, key, value):
+    """Retorna (True, None) se válido, ou (False, mensagem) se inválido."""
+    full = f"{section}.{key}"
+    if full not in SCHEMA:
+        return True, None
+    validator, hint = SCHEMA[full]
+    try:
+        ok = validator(value)
+        if not ok:
+            raise ValueError
+        return True, None
+    except (ValueError, TypeError):
+        return False, f"Valor inválido para {full} — esperado: {hint}"
+
+
+# ── Helpers de runtime ─────────────────────────────────────────────────────────
+
+def read_status():
+    """Retorna dict de status ou None se não disponível."""
+    try:
+        with open(STATUS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def read_pid():
+    """Retorna PID do daemon ou None."""
+    try:
+        with open(PID_FILE) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def send_sighup():
+    """Envia SIGHUP ao daemon. Retorna (True, msg) ou (False, msg)."""
+    pid = read_pid()
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGHUP)
+            return True, "SIGHUP enviado."
+        except ProcessLookupError:
+            pass
+
+    result = subprocess.run(
+        ["systemctl", "kill", "-s", "HUP", "linuwu-fan-control"],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True, "SIGHUP via systemctl enviado."
+    return False, "Daemon não está rodando."
+
+
+# ── Config helpers ─────────────────────────────────────────────────────────────
+
+def read_config():
+    """Retorna ConfigParser carregado (pode estar vazio se arquivo não existir)."""
+    cfg = ConfigParser()
+    cfg.read(CONFIG_PATH)
+    return cfg
+
+
+def update_config_key(section, key, value):
+    """
+    Atualiza KEY no CONFIG_PATH preservando comentários.
+    Usa substituição linha-a-linha + os.replace() para escrita atômica.
+    Levanta ValueError se section/key não encontrado.
+    Levanta PermissionError se sem permissão de escrita.
+    """
+    with open(CONFIG_PATH, "r") as f:
+        lines = f.readlines()
+
+    in_section = False
+    replaced = False
+    out = []
+    section_re = re.compile(r"^\[([^\]]+)\]")
+    key_re = re.compile(r"^(\s*" + re.escape(key) + r"\s*[=:])(.*)$")
+
+    for line in lines:
+        m_sec = section_re.match(line)
+        if m_sec:
+            in_section = (m_sec.group(1).strip() == section)
+            out.append(line)
+            continue
+
+        if in_section and not replaced:
+            m_key = key_re.match(line)
+            if m_key:
+                rest = m_key.group(2)
+                inline_comment = ""
+                if "#" in rest:
+                    idx = rest.index("#")
+                    inline_comment = "  " + rest[idx:].rstrip()
+                out.append(f"{key} = {value}{inline_comment}\n")
+                replaced = True
+                continue
+
+        out.append(line)
+
+    if not replaced:
+        raise ValueError(f"Chave '{section}.{key}' não encontrada em {CONFIG_PATH}")
+
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(out)
+    os.replace(tmp, CONFIG_PATH)
+
+
+# ── Formatação ─────────────────────────────────────────────────────────────────
+
+def fan_bar(pct, width=14):
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def fmt_status_lines(data, cfg):
+    """Retorna lista de strings para o painel de status."""
+    if data is None:
+        return ["  Daemon não está rodando — sem dados de status."]
+
+    age = time.time() - data.get("ts", 0)
+    stale = age > STALE_SECS
+
+    cpu_t  = f"{data['cpu_temp']:.1f}°C"  if data.get("cpu_temp")  is not None else " N/A  "
+    gpu_t  = f"{data['gpu_temp']:.1f}°C"  if data.get("gpu_temp")  is not None else " N/A  "
+    cpu_w  = f"{data['cpu_watts']:.1f}W"  if data.get("cpu_watts") is not None else " N/A "
+    gpu_w  = f"{data['gpu_watts']:.1f}W"  if data.get("gpu_watts") is not None else " N/A "
+    cpu_f  = data.get("cpu_fan", 0)
+    gpu_f  = data.get("gpu_fan", 0)
+    target = cfg.get("power", "target_watts", fallback="?")
+
+    stale_tag = "  [dados desatualizados]" if stale else ""
+
+    return [
+        f" CPU  {cpu_t:>7}  {cpu_w:>6}  Fan {fan_bar(cpu_f)}  {cpu_f:3d}%",
+        f" GPU  {gpu_t:>7}  {gpu_w:>6}  Fan {fan_bar(gpu_f)}  {gpu_f:3d}%",
+        f" Target: {target}W{stale_tag}",
+    ]
+
+
+# ── TUI ────────────────────────────────────────────────────────────────────────
+
+def tui_main(stdscr):
+    curses.curs_set(0)
+    curses.halfdelay(20)  # getch timeout 2s → auto-refresh
+
+    has_color = curses.has_colors()
+    if has_color:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN,  -1)  # running
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)  # disabled / warn
+        curses.init_pair(3, curses.COLOR_CYAN,   -1)  # section headers
+        curses.init_pair(4, curses.COLOR_RED,    -1)  # error
+        curses.init_pair(5, curses.COLOR_WHITE,  -1)  # normal
+        C_RUN   = curses.color_pair(1) | curses.A_BOLD
+        C_WARN  = curses.color_pair(2) | curses.A_BOLD
+        C_SEC   = curses.color_pair(3)
+        C_ERR   = curses.color_pair(4) | curses.A_BOLD
+        C_SEL   = curses.A_REVERSE
+        C_NORM  = 0
+    else:
+        C_RUN = C_WARN = C_SEC = C_ERR = C_SEL = C_NORM = 0
+
+    is_root = (os.geteuid() == 0)
+    cursor  = 0       # índice em PARAM_ORDER
+    msg     = ""      # mensagem temporária na barra de status
+    msg_ts  = 0.0
+
+    def set_msg(text, error=False):
+        nonlocal msg, msg_ts
+        msg    = text
+        msg_ts = time.time()
+
+    def draw(data, cfg):
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        W = width - 1
+
+        enabled = data.get("enabled", True) if data else True
+        state_txt = "running" if (data and enabled) else ("disabled" if data else "sem dados")
+        bullet    = "●"
+
+        # ── Título ──────────────────────────────────────────────────────────
+        title = f" linuwu-fan-control  {bullet}  {state_txt} "
+        stdscr.addstr(0, 0, title[:W], C_RUN if (data and enabled) else C_WARN)
+        stdscr.addstr(0, len(title) if len(title) < W else W,
+                      "─" * max(0, W - len(title)))
+
+        # ── Status ──────────────────────────────────────────────────────────
+        status_lines = fmt_status_lines(data, cfg)
+        for i, line in enumerate(status_lines, start=1):
+            if i < height - 2:
+                stdscr.addstr(i, 0, line[:W])
+
+        sep_row = len(status_lines) + 1
+        if sep_row < height - 2:
+            stdscr.addstr(sep_row, 0, "─" * W + " Configuração")
+
+        # ── Parâmetros ──────────────────────────────────────────────────────
+        list_start  = sep_row + 1
+        list_height = height - list_start - 2  # reservar 2 linhas no fundo
+        if list_height < 1:
+            list_height = 1
+
+        # Scroll para manter cursor visível
+        scroll = max(0, cursor - list_height + 1)
+        scroll = min(scroll, max(0, len(PARAM_ORDER) - list_height))
+
+        prev_section = None
+        visual_idx = 0  # linha visual dentro da lista (incluindo cabeçalhos de seção)
+        drawn = 0
+
+        for idx, (sec, key) in enumerate(PARAM_ORDER):
+            if drawn >= list_height:
+                break
+
+            need_header = (sec != prev_section)
+            prev_section = sec
+
+            # Header de seção — não rola junto, mostra sempre antes do primeiro item
+            if need_header and idx >= scroll:
+                row = list_start + drawn
+                if row < height - 2:
+                    stdscr.addstr(row, 0, f"  [{sec}]"[:W], C_SEC)
+                drawn += 1
+                if drawn >= list_height:
+                    break
+
+            if idx < scroll:
+                continue
+
+            val = cfg.get(sec, key, fallback="—")
+            # Truncar curvas longas
+            display_val = val if len(val) <= 38 else val[:35] + "..."
+
+            row = list_start + drawn
+            if row >= height - 2:
+                break
+
+            sel = (idx == cursor)
+            attr = C_SEL if sel else C_NORM
+            marker = "▶" if sel else " "
+            line = f"  {marker} {key:<16} {display_val}"
+            stdscr.addstr(row, 0, line[:W], attr)
+            drawn += 1
+
+        # ── Barra de status / ajuda ──────────────────────────────────────────
+        help_row = height - 2
+        sep_row2 = height - 3
+        if sep_row2 > list_start and sep_row2 < height:
+            try:
+                stdscr.addstr(sep_row2, 0, "─" * W)
+            except curses.error:
+                pass
+
+        if time.time() - msg_ts < 3.0 and msg:
+            attr = C_ERR if msg.startswith("Erro") else (C_RUN if has_color else 0)
+            try:
+                stdscr.addstr(help_row, 0, (" " + msg)[:W], attr)
+            except curses.error:
+                pass
+        else:
+            root_hint = "  ↑↓ navegar  Enter editar  r recarregar  q sair"
+            noroot    = "  ↑↓ navegar  q sair  (execute como root para editar)"
+            hint = root_hint if is_root else noroot
+            try:
+                stdscr.addstr(help_row, 0, hint[:W])
+            except curses.error:
+                pass
+
+        try:
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+    def edit_param(sec, key, cfg):
+        """Abre prompt de edição no rodapé e aplica a mudança."""
+        if not is_root:
+            set_msg("Erro: requer root. Execute: sudo linuwu-fan-ctl")
+            return
+
+        current = cfg.get(sec, key, fallback="")
+        height, width = stdscr.getmaxyx()
+        prompt = f" Novo valor para {sec}.{key} [{current}]: "
+
+        # Limpa a linha de prompt
+        try:
+            stdscr.addstr(height - 2, 0, " " * (width - 1))
+            stdscr.addstr(height - 2, 0, prompt[: width - 1])
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+        curses.echo()
+        curses.nocbreak()
+        curses.curs_set(1)
+        try:
+            raw = stdscr.getstr(height - 2, len(prompt), width - len(prompt) - 2)
+        except curses.error:
+            raw = b""
+        finally:
+            curses.curs_set(0)
+            curses.noecho()
+            curses.halfdelay(20)
+
+        new_val = raw.decode("utf-8", errors="replace").strip()
+        if not new_val:
+            set_msg("Cancelado.")
+            return
+
+        ok, err = validate_value(sec, key, new_val)
+        if not ok:
+            set_msg(f"Erro: {err}")
+            return
+
+        try:
+            update_config_key(sec, key, new_val)
+        except (ValueError, PermissionError, OSError) as e:
+            set_msg(f"Erro ao salvar: {e}")
+            return
+
+        ok2, rmsg = send_sighup()
+        set_msg(f"Salvo: {sec}.{key} = {new_val}  ({rmsg})")
+
+    # ── Loop principal ───────────────────────────────────────────────────────
+    while True:
+        data = read_status()
+        cfg  = read_config()
+        draw(data, cfg)
+
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+
+        if ch == curses.ERR:
+            continue
+        elif ch in (ord("q"), ord("Q"), 27):  # 27 = ESC
+            break
+        elif ch in (ord("r"), ord("R")):
+            if is_root:
+                ok, rmsg = send_sighup()
+                set_msg(rmsg)
+            else:
+                set_msg("Erro: requer root para recarregar.")
+        elif ch == curses.KEY_UP:
+            cursor = max(0, cursor - 1)
+        elif ch == curses.KEY_DOWN:
+            cursor = min(len(PARAM_ORDER) - 1, cursor + 1)
+        elif ch in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            sec, key = PARAM_ORDER[cursor]
+            edit_param(sec, key, cfg)
+        elif ch == curses.KEY_RESIZE:
+            stdscr.clear()
+
+
+# ── CLI helpers ────────────────────────────────────────────────────────────────
+
+def _fmt_status_plain(data, cfg):
+    if data is None:
+        return "Daemon não está rodando (sem status file)."
+    age = time.time() - data.get("ts", 0)
+    stale = f"  [AVISO: dados com {age:.0f}s — daemon pode não estar ativo]" if age > STALE_SECS else ""
+    cpu_t  = f"{data['cpu_temp']:.1f}°C"  if data.get("cpu_temp")  is not None else " N/A  "
+    gpu_t  = f"{data['gpu_temp']:.1f}°C"  if data.get("gpu_temp")  is not None else " N/A  "
+    cpu_w  = f"{data['cpu_watts']:.1f}W"  if data.get("cpu_watts") is not None else " N/A "
+    gpu_w  = f"{data['gpu_watts']:.1f}W"  if data.get("gpu_watts") is not None else " N/A "
+    cpu_f  = data.get("cpu_fan", 0)
+    gpu_f  = data.get("gpu_fan", 0)
+    target = cfg.get("power", "target_watts", fallback="?")
+    state  = "running" if data.get("enabled") else "disabled"
+    sep    = "─" * 43
+    return "\n".join([
+        f"linuwu-fan-control  ●  {state}{stale}",
+        sep,
+        f" CPU  {cpu_t:>7}  {cpu_w:>6}  Fan {fan_bar(cpu_f)}  {cpu_f:3d}%",
+        f" GPU  {gpu_t:>7}  {gpu_w:>6}  Fan {fan_bar(gpu_f)}  {gpu_f:3d}%",
+        sep,
+        f" Target: {target}W  |  Poll: {cfg.get('general','poll_interval',fallback='?')}s"
+        f"  |  Ramp: {cfg.get('general','ramp_step',fallback='?')}%/cycle",
+    ])
+
+
+# ── Subcomandos CLI ────────────────────────────────────────────────────────────
+
+def cmd_status(args):
+    cfg = read_config()
+    if args.watch:
+        try:
+            while True:
+                print("\033[2J\033[H" + _fmt_status_plain(read_status(), cfg), flush=True)
+                time.sleep(2)
+                cfg = read_config()
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(_fmt_status_plain(read_status(), cfg))
+
+
+def cmd_get(args):
+    cfg = read_config()
+    if args.key:
+        parts = args.key.split(".", 1)
+        if len(parts) != 2:
+            sys.exit("Formato: SECTION.KEY  (ex: power.target_watts)")
+        sec, key = parts
+        try:
+            print(cfg.get(sec, key))
+        except Exception:
+            sys.exit(f"Chave '{args.key}' não encontrada.")
+    else:
+        for sec in cfg.sections():
+            print(f"[{sec}]")
+            for k, v in cfg.items(sec):
+                print(f"  {k:<20} = {v}")
+            print()
+
+
+def cmd_set(args):
+    if os.geteuid() != 0:
+        sys.exit(
+            f"Permissão negada: 'set' requer root.\n"
+            f"  Dica: sudo linuwu-fan-ctl set {args.key} {args.value}"
+        )
+    parts = args.key.split(".", 1)
+    if len(parts) != 2:
+        sys.exit("Formato: SECTION.KEY  (ex: power.target_watts)")
+    sec, key = parts
+
+    ok, err = validate_value(sec, key, args.value)
+    if not ok:
+        sys.exit(err)
+
+    try:
+        update_config_key(sec, key, args.value)
+    except ValueError as e:
+        sys.exit(str(e))
+    except PermissionError:
+        sys.exit(f"Sem permissão para escrever em {CONFIG_PATH}")
+
+    ok2, rmsg = send_sighup()
+    status = "daemon recarregado" if ok2 else "config salva (daemon não está rodando)"
+    print(f"Set {sec}.{key} = {args.value}  ({status})")
+
+
+def cmd_reload(args):
+    if os.geteuid() != 0:
+        sys.exit("Permissão negada: 'reload' requer root.\n  Dica: sudo linuwu-fan-ctl reload")
+    ok, msg = send_sighup()
+    print(msg)
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_enable(args):
+    args.key   = "general.enabled"
+    args.value = "true"
+    cmd_set(args)
+
+
+def cmd_disable(args):
+    args.key   = "general.enabled"
+    args.value = "false"
+    cmd_set(args)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="linuwu-fan-ctl",
+        description="Interface de gerenciamento para o linuwu-fan-control daemon.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Sem argumentos → abre TUI interativa (curses).",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_status = sub.add_parser("status", help="Mostrar status atual")
+    p_status.add_argument("--watch", action="store_true", help="Atualizar a cada 2s (Ctrl+C para sair)")
+    p_status.set_defaults(func=cmd_status)
+
+    p_get = sub.add_parser("get", help="Ler valores de configuração")
+    p_get.add_argument("key", nargs="?", metavar="SECTION.KEY",
+                       help="Ex: power.target_watts (omita para mostrar tudo)")
+    p_get.set_defaults(func=cmd_get)
+
+    p_set = sub.add_parser("set", help="Atualizar um parâmetro (requer root)")
+    p_set.add_argument("key",   metavar="SECTION.KEY")
+    p_set.add_argument("value", metavar="VALOR")
+    p_set.set_defaults(func=cmd_set)
+
+    p_reload = sub.add_parser("reload", help="Forçar reload imediato via SIGHUP (requer root)")
+    p_reload.set_defaults(func=cmd_reload)
+
+    p_enable  = sub.add_parser("enable",  help="Ativar controle (general.enabled=true, requer root)")
+    p_enable.set_defaults(func=cmd_enable)
+    p_disable = sub.add_parser("disable", help="Desativar controle (general.enabled=false, requer root)")
+    p_disable.set_defaults(func=cmd_disable)
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        # Sem subcomando → TUI
+        try:
+            curses.wrapper(tui_main)
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            sys.exit(f"Erro na TUI: {e}")
+    else:
+        args.func(args)
+
+
+if __name__ == "__main__":
+    main()

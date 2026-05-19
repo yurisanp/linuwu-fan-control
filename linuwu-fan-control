@@ -11,17 +11,22 @@ Serviço:      systemctl {start|stop|enable|disable} linuwu-fan-control
 """
 
 import glob
+import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from configparser import ConfigParser
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-FAN_PATH    = "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed"
-CONFIG_PATH = "/etc/linuwu-fan-control.conf"
-LOG_PATH    = "/var/log/linuwu-fan-control.log"
+FAN_PATH     = "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed"
+CONFIG_PATH  = "/etc/linuwu-fan-control.conf"
+LOG_PATH     = "/var/log/linuwu-fan-control.log"
+PID_FILE     = "/run/linuwu-fan-control.pid"
+STATUS_FILE  = "/run/linuwu-fan-control.status"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -78,6 +83,24 @@ def find_rapl_path():
         if os.path.exists(p):
             return p
     return None
+
+
+def find_nvidia_smi() -> str | None:
+    """Retorna o path do nvidia-smi se disponível no sistema."""
+    return shutil.which("nvidia-smi")
+
+
+def write_pid():
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()) + "\n")
+    os.chmod(PID_FILE, 0o644)
+
+
+def remove_pid():
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -151,19 +174,43 @@ class FanController:
         self._last_energy_time: float | None = None
         self._running = True
 
-        self.cpu_temp_path = find_cpu_temp_path()
-        self.gpu_temp_path = find_hwmon_path("amdgpu", "temp2_input", "temp1_input")
-        self.rapl_path     = find_rapl_path()
-        self.gpu_power_path = find_hwmon_path("amdgpu", "power1_average", "power1_input")
+        self.cpu_temp_path  = find_cpu_temp_path()
+        self.rapl_path      = find_rapl_path()
+        self.nvidia_smi     = find_nvidia_smi()
 
+        # GPU via hwmon (amdgpu) ou nvidia-smi — mutuamente exclusivos
+        if self.nvidia_smi:
+            self.gpu_temp_path  = None
+            self.gpu_power_path = None
+        else:
+            self.gpu_temp_path  = find_hwmon_path("amdgpu", "temp2_input", "temp1_input")
+            self.gpu_power_path = find_hwmon_path("amdgpu", "power1_average", "power1_input")
+
+        # Limite real do contador RAPL para rollover correto
+        self._rapl_max_energy = self._read_rapl_max_energy()
+
+        gpu_source = f"nvidia-smi ({self.nvidia_smi})" if self.nvidia_smi else (self.gpu_temp_path or "— não encontrado")
         log.info("Sensores detectados:")
         log.info(f"  CPU temp  : {self.cpu_temp_path or '— não encontrado'}")
-        log.info(f"  GPU temp  : {self.gpu_temp_path or '— não encontrado'}")
+        log.info(f"  GPU       : {gpu_source}")
         log.info(f"  CPU RAPL  : {self.rapl_path or '— não encontrado'}")
-        log.info(f"  GPU power : {self.gpu_power_path or '— não encontrado'}")
+        log.info(f"  GPU power : {'via nvidia-smi' if self.nvidia_smi else (self.gpu_power_path or '— não encontrado')}")
 
+        self._force_reload = False
         signal.signal(signal.SIGTERM, self._shutdown)
-        signal.signal(signal.SIGINT, self._shutdown)
+        signal.signal(signal.SIGINT,  self._shutdown)
+        signal.signal(signal.SIGHUP,  self._handle_sighup)
+
+    def _read_rapl_max_energy(self) -> int:
+        """Lê max_energy_range_uj para rollover correto (32 ou 64 bits conforme o kernel)."""
+        if not self.rapl_path:
+            return 2**32
+        max_path = self.rapl_path.replace("energy_uj", "max_energy_range_uj")
+        val = read_int(max_path)
+        return val if val is not None else 2**32
+
+    def _handle_sighup(self, *_):
+        self._force_reload = True
 
     # ── Leituras ──────────────────────────────────────────────────────────────
 
@@ -172,8 +219,37 @@ class FanController:
         return val / 1000.0 if val is not None else None
 
     def gpu_temp(self) -> float | None:
+        """Temperatura GPU via hwmon (somente AMD)."""
         val = read_int(self.gpu_temp_path) if self.gpu_temp_path else None
         return val / 1000.0 if val is not None else None
+
+    def gpu_watts(self) -> float | None:
+        """Potência GPU via hwmon (somente AMD)."""
+        val = read_int(self.gpu_power_path) if self.gpu_power_path else None
+        return val / 1e6 if val is not None else None  # µW → W
+
+    def _query_nvidia(self) -> tuple[float | None, float | None]:
+        """Retorna (temp_C, watts) da GPU NVIDIA via nvidia-smi em uma única chamada."""
+        try:
+            out = subprocess.check_output(
+                [self.nvidia_smi,
+                 "--query-gpu=temperature.gpu,power.draw",
+                 "--format=csv,noheader,nounits"],
+                timeout=3.0,
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            parts = [p.strip() for p in out.split(",")]
+            temp = float(parts[0]) if len(parts) > 0 and parts[0] not in ("", "[N/A]") else None
+            pwr  = float(parts[1]) if len(parts) > 1 and parts[1] not in ("", "[N/A]") else None
+            return temp, pwr
+        except Exception:
+            return None, None
+
+    def _gpu_readings(self) -> tuple[float | None, float | None]:
+        """Retorna (temp_C, watts) da GPU — NVIDIA ou AMD conforme hardware detectado."""
+        if self.nvidia_smi:
+            return self._query_nvidia()
+        return self.gpu_temp(), self.gpu_watts()
 
     def cpu_watts(self) -> float | None:
         if not self.rapl_path:
@@ -191,15 +267,11 @@ class FanController:
             return None
         de = energy - self._last_energy
         if de < 0:
-            de += 2**32  # proteção contra rollover do contador
+            de += self._rapl_max_energy  # rollover protection (32 ou 64 bits)
         watts = de / 1e6 / dt  # µJ → J → W
         self._last_energy = energy
         self._last_energy_time = now
         return watts
-
-    def gpu_watts(self) -> float | None:
-        val = read_int(self.gpu_power_path) if self.gpu_power_path else None
-        return val / 1e6 if val is not None else None  # µW → W
 
     # ── Controle ──────────────────────────────────────────────────────────────
 
@@ -214,21 +286,44 @@ class FanController:
     def _shutdown(self, *_):
         log.info("Encerrando — restaurando controle automático (fan=0,0)")
         self._set_fans(0, 0)
+        remove_pid()
         self._running = False
+
+    def _write_status(self, ct, gt, cw, gw, cpu_fan, gpu_fan, enabled):
+        data = {
+            "cpu_temp":  round(ct, 2)  if ct  is not None else None,
+            "gpu_temp":  round(gt, 2)  if gt  is not None else None,
+            "cpu_watts": round(cw, 2)  if cw  is not None else None,
+            "gpu_watts": round(gw, 2)  if gw  is not None else None,
+            "cpu_fan":   int(round(cpu_fan)),
+            "gpu_fan":   int(round(gpu_fan)),
+            "ts":        time.time(),
+            "enabled":   enabled,
+        }
+        tmp = STATUS_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, STATUS_FILE)
+        except OSError as e:
+            log.warning(f"Não foi possível gravar status: {e}")
 
     # ── Loop principal ────────────────────────────────────────────────────────
 
     def run(self):
         log.info("linuwu-fan-control iniciado.")
+        write_pid()
         cfg_mtime = 0.0
 
         while self._running:
-            # Recarrega config somente quando o arquivo muda (sem overhead desnecessário)
+            # Recarrega config quando arquivo muda ou SIGHUP recebido
             try:
                 mtime = os.path.getmtime(CONFIG_PATH)
             except OSError:
                 mtime = 0.0
-            if mtime != cfg_mtime:
+            if mtime != cfg_mtime or self._force_reload:
+                self._force_reload = False
                 cfg = ConfigParser()
                 cfg.read(CONFIG_PATH)
                 cfg_mtime = mtime
@@ -258,14 +353,14 @@ class FanController:
                 self._set_fans(0, 0)
                 self.cpu_fan = 0.0
                 self.gpu_fan = 0.0
+                self._write_status(None, None, None, None, 0, 0, False)
                 time.sleep(poll)
                 continue
 
-            # Leituras
+            # Leituras — GPU em chamada única (evita dois subprocessos se for nvidia)
             ct = self.cpu_temp()
-            gt = self.gpu_temp()
+            gt, gw = self._gpu_readings()
             cw = self.cpu_watts()
-            gw = self.gpu_watts()
             total_w = (cw or 0.0) + (gw or 0.0)
 
             # Velocidade desejada: máximo entre curva de temp e curva de potência
@@ -300,13 +395,14 @@ class FanController:
                 self._set_fans(new_cpu, new_gpu)
                 log.info(
                     f"Fan → CPU:{int(new_cpu):3d}%  GPU:{int(new_gpu):3d}%  |  "
-                    f"CPU:{ct:.1f}°C  GPU:{gt:.1f if gt else '?':>5}°C  |  "
-                    f"CPU:{cw:.1f if cw else '?':>5}W  GPU:{gw:.1f if gw else '?':>5}W  "
+                    f"CPU:{f'{ct:.1f}' if ct is not None else '?':>5}°C  GPU:{f'{gt:.1f}' if gt is not None else '?':>5}°C  |  "
+                    f"CPU:{f'{cw:.1f}' if cw is not None else '?':>5}W  GPU:{f'{gw:.1f}' if gw is not None else '?':>5}W  "
                     f"(meta: {target_w}W)"
                 )
 
             self.cpu_fan = new_cpu
             self.gpu_fan = new_gpu
+            self._write_status(ct, gt, cw, gw, new_cpu, new_gpu, True)
 
             time.sleep(poll)
 

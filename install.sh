@@ -30,6 +30,10 @@ fi
 info "Instalando daemon em /usr/local/bin/linuwu-fan-control..."
 install -m 755 "$SCRIPT_DIR/linuwu-fan-control" /usr/local/bin/linuwu-fan-control
 
+# ── 3b. Instala o CLI de controle ─────────────────────────────────────────────
+info "Instalando CLI em /usr/local/bin/linuwu-fan-ctl..."
+install -m 755 "$SCRIPT_DIR/linuwu-fan-ctl" /usr/local/bin/linuwu-fan-ctl
+
 # ── 4. Instala configuração (não sobrescreve se já existir) ───────────────────
 if [[ -f /etc/linuwu-fan-control.conf ]]; then
     warn "Configuração já existe em /etc/linuwu-fan-control.conf — mantendo a existente."
@@ -60,11 +64,18 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo "  Comandos úteis:"
 echo ""
-echo "  Verificar status      :  sudo systemctl status linuwu-fan-control"
-echo "  Ver logs em tempo real:  sudo journalctl -fu linuwu-fan-control"
-echo "  Parar (ventoinhas=auto):  sudo systemctl stop linuwu-fan-control"
+echo "  Interface interativa  :  linuwu-fan-ctl"
+echo "  Status rápido         :  linuwu-fan-ctl status"
+echo "  Status ao vivo        :  linuwu-fan-ctl status --watch"
+echo "  Recarregar config     :  sudo linuwu-fan-ctl reload"
+echo "  Ver configuração      :  linuwu-fan-ctl get"
+echo "  Ajustar parâmetro     :  sudo linuwu-fan-ctl set power.target_watts 60"
+echo "  Desativar controle    :  sudo linuwu-fan-ctl disable"
+echo "  Reativar controle     :  sudo linuwu-fan-ctl enable"
+echo ""
+echo "  Logs do serviço       :  sudo journalctl -fu linuwu-fan-control"
+echo "  Parar (fan=auto)      :  sudo systemctl stop linuwu-fan-control"
 echo "  Desligar do boot      :  sudo systemctl disable linuwu-fan-control"
-echo "  Reiniciar após editar config:  sudo systemctl restart linuwu-fan-control"
 echo ""
 echo "  Configuração          :  /etc/linuwu-fan-control.conf"
 echo "  Log                   :  /var/log/linuwu-fan-control.log"
