@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+linuwu-fan-control
+──────────────────
+Daemon de controle de ventoinhas baseado em temperatura e consumo de watts
+para laptops Acer Predator com o driver Linuwu-Sense.
+
+Configuração: /etc/linuwu-fan-control.conf
+Log:          /var/log/linuwu-fan-control.log
+Serviço:      systemctl {start|stop|enable|disable} linuwu-fan-control
+"""
+
+import glob
+import logging
+import os
+import signal
+import sys
+import time
+from configparser import ConfigParser
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+FAN_PATH    = "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed"
+CONFIG_PATH = "/etc/linuwu-fan-control.conf"
+LOG_PATH    = "/var/log/linuwu-fan-control.log"
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ── Sensor discovery ───────────────────────────────────────────────────────────
+
+def find_cpu_temp_path():
+    """Retorna o path do sensor de temperatura do pacote CPU (x86_pkg_temp)."""
+    for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+        type_file = zone.replace("temp", "type")
+        try:
+            with open(type_file) as f:
+                kind = f.read().strip()
+            if "x86_pkg_temp" in kind or "package" in kind.lower():
+                return zone
+        except OSError:
+            pass
+    # fallback: primeira zona disponível
+    zones = sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp"))
+    return zones[0] if zones else None
+
+
+def find_hwmon_path(name, *candidates):
+    """Retorna o path de um arquivo hwmon dentro de um hwmon com dado nome."""
+    for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name_file = os.path.join(hwmon, "name")
+        try:
+            with open(name_file) as f:
+                hwmon_name = f.read().strip()
+            if hwmon_name == name:
+                for c in candidates:
+                    path = os.path.join(hwmon, c)
+                    if os.path.exists(path):
+                        return path
+        except OSError:
+            pass
+    return None
+
+
+def find_rapl_path():
+    for p in (
+        "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
+        "/sys/class/powercap/intel-rapl:0/energy_uj",
+    ):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def parse_curve(raw: str) -> list[tuple[float, float]]:
+    """'45:20, 65:50, 85:90'  →  [(45,20), (65,50), (85,90)]"""
+    points = []
+    for token in raw.split(","):
+        token = token.strip()
+        if ":" in token:
+            x, y = token.split(":", 1)
+            try:
+                points.append((float(x), float(y)))
+            except ValueError:
+                pass
+    return sorted(points, key=lambda p: p[0])
+
+
+def interpolate(curve: list[tuple[float, float]], value: float) -> float:
+    if not curve:
+        return 0.0
+    if value <= curve[0][0]:
+        return curve[0][1]
+    if value >= curve[-1][0]:
+        return curve[-1][1]
+    for i in range(len(curve) - 1):
+        x0, y0 = curve[i]
+        x1, y1 = curve[i + 1]
+        if x0 <= value <= x1:
+            t = (value - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return curve[-1][1]
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def ramp(current: float, target: float, step: float) -> float:
+    """Limita a variação por ciclo para evitar saltos bruscos de RPM."""
+    delta = target - current
+    if abs(delta) <= step:
+        return target
+    return current + step * (1.0 if delta > 0 else -1.0)
+
+
+def apply_hysteresis(current: float, desired: float, hyst: float) -> float:
+    """Só reduz a ventoinha se a queda for maior que a zona morta."""
+    if desired >= current:
+        return desired
+    if (current - desired) >= hyst:
+        return desired
+    return current
+
+
+# ── Controller ─────────────────────────────────────────────────────────────────
+
+class FanController:
+    def __init__(self):
+        self.cpu_fan: float = 0.0
+        self.gpu_fan: float = 0.0
+        self._last_energy: int | None = None
+        self._last_energy_time: float | None = None
+        self._running = True
+
+        self.cpu_temp_path = find_cpu_temp_path()
+        self.gpu_temp_path = find_hwmon_path("amdgpu", "temp2_input", "temp1_input")
+        self.rapl_path     = find_rapl_path()
+        self.gpu_power_path = find_hwmon_path("amdgpu", "power1_average", "power1_input")
+
+        log.info("Sensores detectados:")
+        log.info(f"  CPU temp  : {self.cpu_temp_path or '— não encontrado'}")
+        log.info(f"  GPU temp  : {self.gpu_temp_path or '— não encontrado'}")
+        log.info(f"  CPU RAPL  : {self.rapl_path or '— não encontrado'}")
+        log.info(f"  GPU power : {self.gpu_power_path or '— não encontrado'}")
+
+        signal.signal(signal.SIGTERM, self._shutdown)
+        signal.signal(signal.SIGINT, self._shutdown)
+
+    # ── Leituras ──────────────────────────────────────────────────────────────
+
+    def cpu_temp(self) -> float | None:
+        val = read_int(self.cpu_temp_path) if self.cpu_temp_path else None
+        return val / 1000.0 if val is not None else None
+
+    def gpu_temp(self) -> float | None:
+        val = read_int(self.gpu_temp_path) if self.gpu_temp_path else None
+        return val / 1000.0 if val is not None else None
+
+    def cpu_watts(self) -> float | None:
+        if not self.rapl_path:
+            return None
+        energy = read_int(self.rapl_path)
+        now = time.monotonic()
+        if energy is None:
+            return None
+        if self._last_energy is None:
+            self._last_energy = energy
+            self._last_energy_time = now
+            return None
+        dt = now - self._last_energy_time
+        if dt < 0.1:
+            return None
+        de = energy - self._last_energy
+        if de < 0:
+            de += 2**32  # proteção contra rollover do contador
+        watts = de / 1e6 / dt  # µJ → J → W
+        self._last_energy = energy
+        self._last_energy_time = now
+        return watts
+
+    def gpu_watts(self) -> float | None:
+        val = read_int(self.gpu_power_path) if self.gpu_power_path else None
+        return val / 1e6 if val is not None else None  # µW → W
+
+    # ── Controle ──────────────────────────────────────────────────────────────
+
+    def _set_fans(self, cpu: float, gpu: float):
+        cpu_i, gpu_i = int(round(cpu)), int(round(gpu))
+        try:
+            with open(FAN_PATH, "w") as f:
+                f.write(f"{cpu_i},{gpu_i}\n")
+        except OSError as e:
+            log.error(f"Erro ao escrever fan_speed: {e}")
+
+    def _shutdown(self, *_):
+        log.info("Encerrando — restaurando controle automático (fan=0,0)")
+        self._set_fans(0, 0)
+        self._running = False
+
+    # ── Loop principal ────────────────────────────────────────────────────────
+
+    def run(self):
+        log.info("linuwu-fan-control iniciado.")
+        cfg_mtime = 0.0
+
+        while self._running:
+            # Recarrega config somente quando o arquivo muda (sem overhead desnecessário)
+            try:
+                mtime = os.path.getmtime(CONFIG_PATH)
+            except OSError:
+                mtime = 0.0
+            if mtime != cfg_mtime:
+                cfg = ConfigParser()
+                cfg.read(CONFIG_PATH)
+                cfg_mtime = mtime
+                log.info("Configuração recarregada.")
+
+            try:
+                poll     = cfg.getfloat("general", "poll_interval",  fallback=2.0)
+                step     = cfg.getfloat("general", "ramp_step",      fallback=5.0)
+                hyst     = cfg.getfloat("general", "hysteresis",     fallback=3.0)
+                enabled  = cfg.getboolean("general", "enabled",      fallback=True)
+                target_w = cfg.getfloat("power",   "target_watts",   fallback=45.0)
+                cpu_min  = cfg.getfloat("limits",  "cpu_fan_min",    fallback=0.0)
+                cpu_max  = cfg.getfloat("limits",  "cpu_fan_max",    fallback=100.0)
+                gpu_min  = cfg.getfloat("limits",  "gpu_fan_min",    fallback=0.0)
+                gpu_max  = cfg.getfloat("limits",  "gpu_fan_max",    fallback=100.0)
+
+                power_curve    = parse_curve(cfg.get("power",    "curve", fallback="15:15,35:45,55:65,80:90,100:100"))
+                cpu_temp_curve = parse_curve(cfg.get("cpu_temp", "curve", fallback="45:20,55:35,65:50,75:70,85:90,95:100"))
+                gpu_temp_curve = parse_curve(cfg.get("gpu_temp", "curve", fallback="45:20,55:35,65:50,75:70,85:90,95:100"))
+            except Exception as e:
+                log.error(f"Erro na config: {e}")
+                time.sleep(2.0)
+                continue
+
+            # Controle desligado → entrega para o firmware
+            if not enabled:
+                self._set_fans(0, 0)
+                self.cpu_fan = 0.0
+                self.gpu_fan = 0.0
+                time.sleep(poll)
+                continue
+
+            # Leituras
+            ct = self.cpu_temp()
+            gt = self.gpu_temp()
+            cw = self.cpu_watts()
+            gw = self.gpu_watts()
+            total_w = (cw or 0.0) + (gw or 0.0)
+
+            # Velocidade desejada: máximo entre curva de temp e curva de potência
+            des_cpu = des_gpu = 0.0
+
+            if ct is not None:
+                des_cpu = max(des_cpu, interpolate(cpu_temp_curve, ct))
+            if gt is not None:
+                des_gpu = max(des_gpu, interpolate(gpu_temp_curve, gt))
+
+            if total_w > 0:
+                pf = interpolate(power_curve, total_w)
+                des_cpu = max(des_cpu, pf)
+                des_gpu = max(des_gpu, pf)
+
+            # Boost extra quando CPU está acima do alvo de watts
+            if cw is not None and cw > target_w and target_w > 0:
+                excess_ratio = min((cw - target_w) / target_w, 1.0)
+                des_cpu = min(des_cpu + excess_ratio * (cpu_max - des_cpu), cpu_max)
+                des_gpu = min(des_gpu + excess_ratio * 0.7 * (gpu_max - des_gpu), gpu_max)
+
+            des_cpu = clamp(des_cpu, cpu_min, cpu_max)
+            des_gpu = clamp(des_gpu, gpu_min, gpu_max)
+
+            # Histerese e rampa suave
+            des_cpu = apply_hysteresis(self.cpu_fan, des_cpu, hyst)
+            des_gpu = apply_hysteresis(self.gpu_fan, des_gpu, hyst)
+            new_cpu = ramp(self.cpu_fan, des_cpu, step)
+            new_gpu = ramp(self.gpu_fan, des_gpu, step)
+
+            if int(new_cpu) != int(self.cpu_fan) or int(new_gpu) != int(self.gpu_fan):
+                self._set_fans(new_cpu, new_gpu)
+                log.info(
+                    f"Fan → CPU:{int(new_cpu):3d}%  GPU:{int(new_gpu):3d}%  |  "
+                    f"CPU:{ct:.1f}°C  GPU:{gt:.1f if gt else '?':>5}°C  |  "
+                    f"CPU:{cw:.1f if cw else '?':>5}W  GPU:{gw:.1f if gw else '?':>5}W  "
+                    f"(meta: {target_w}W)"
+                )
+
+            self.cpu_fan = new_cpu
+            self.gpu_fan = new_gpu
+
+            time.sleep(poll)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("Erro: este daemon precisa rodar como root.", file=sys.stderr)
+        sys.exit(1)
+    FanController().run()

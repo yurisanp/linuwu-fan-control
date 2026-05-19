@@ -1,0 +1,20 @@
+[Unit]
+Description=Linuwu Fan Control — controle de ventoinhas por temperatura e watts
+Documentation=https://github.com/0x7375646F/Linuwu-Sense
+After=multi-user.target
+# Aguarda o módulo estar carregado
+After=linuwu_sense.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/linuwu-fan-control
+# Restaura ventoinhas para auto ao parar o serviço
+ExecStop=/bin/sh -c 'echo "0,0" > /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed'
+Restart=on-failure
+RestartSec=5
+# Redireciona logs para journald (acessível via journalctl -u linuwu-fan-control)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
