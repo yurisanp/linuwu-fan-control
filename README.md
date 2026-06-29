@@ -14,6 +14,7 @@ O objetivo é manter um perfil térmico silencioso e estável, com ventoinhas co
 - Rampa suave e histerese — sem variações abruptas de RPM
 - Recarrega a configuração automaticamente ao detectar mudanças no arquivo (sem reiniciar o serviço)
 - Persistência via **systemd** com enable/disable sem reboot
+- **Início cedo no boot** — assume o controle logo após o módulo carregar, sem esperar a tela de login (evita ventoinhas a 100% durante todo o boot em modo turbo)
 - Ao parar o serviço, devolve controle automático ao firmware (`fan=0`)
 
 ---
@@ -36,10 +37,32 @@ sudo bash install.sh
 ```
 
 O script de instalação:
-1. Copia o daemon para `/usr/local/bin/`
-2. Instala a configuração em `/etc/linuwu-fan-control.conf` (não sobrescreve se já existir)
-3. Instala e habilita o serviço systemd
-4. Inicia o serviço imediatamente
+1. **Valida** os scripts antes de copiar (shebang na 1ª linha + sintaxe Python) — evita o erro `status=203/EXEC` no systemd
+2. Copia o daemon e o CLI `linuwu-fan-ctl` para `/usr/local/bin/`
+3. **Registra o módulo `linuwu_sense` no DKMS** para recompilação automática a cada atualização de kernel (veja abaixo)
+4. Instala a configuração em `/etc/linuwu-fan-control.conf` (não sobrescreve se já existir)
+5. Instala e habilita o serviço systemd, iniciando o controle **cedo no boot**
+6. Faz um auto-teste pós-instalação (confirma que o serviço subiu)
+
+---
+
+## Recompilação automática do módulo (DKMS)
+
+O módulo de kernel **Linuwu-Sense** precisa ser recompilado a cada atualização de kernel. Em vez de rodar `make install LLVM=1` manualmente toda vez, o `install.sh` registra o módulo no **DKMS**, que o recompila sozinho via hook do pacman sempre que o kernel muda.
+
+- O source do módulo é **vendorizado** em [`linuwu-sense/`](linuwu-sense/) (autocontido no repositório), com seu próprio [`dkms.conf`](linuwu-sense/dkms.conf).
+- A compilação usa `LLVM=1` (kernels CachyOS/zen são compilados com Clang).
+- **Secure Boot**: o instalador detecta automaticamente (`mokutil --sb-state`) e, se ativo, configura o DKMS para assinar o módulo com a chave MOK em `~/module-signing/` (`MOK.priv` + `MOK.der`). Sem Secure Boot, nenhuma assinatura é necessária.
+
+```bash
+# Ver o estado do módulo no DKMS
+dkms status -m linuwu_sense
+
+# Forçar recompilação manual (normalmente desnecessário)
+sudo dkms install -m linuwu_sense -v 1.0 --force
+```
+
+> **Setup único não gerenciado pelo DKMS:** blacklist do `acer_wmi`, grupo `linuwu_sense`, permissões via `tmpfiles.d` e o `linuwu_sense.service` são configurados pelo `Makefile` upstream na primeira instalação do driver. O DKMS cuida apenas da recompilação do `.ko`.
 
 ---
 
@@ -111,9 +134,11 @@ gpu_fan_max = 100
 
 ```
 linuwu-fan-control          ← daemon principal (Python)
+linuwu-fan-ctl              ← CLI de controle/diagnóstico
 linuwu-fan-control.conf     ← configuração editável pelo usuário
-linuwu-fan-control.service  ← unit systemd
-install.sh                  ← script de instalação
+linuwu-fan-control.service  ← unit systemd (início cedo no boot)
+install.sh                  ← script de instalação (valida + registra DKMS)
+linuwu-sense/               ← source vendorizado do módulo (DKMS)
 ```
 
 ### Fluxo do daemon

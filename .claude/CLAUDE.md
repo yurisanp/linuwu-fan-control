@@ -27,9 +27,11 @@ O controle é baseado em três fontes de dados simultâneas: temperatura do CPU,
 
 ```
 linuwu-fan-control          ← daemon principal, executável Python
+linuwu-fan-ctl              ← CLI de controle/diagnóstico (Python)
 linuwu-fan-control.conf     ← configuração INI instalada em /etc/
 linuwu-fan-control.service  ← unit systemd
 install.sh                  ← script de instalação (requer root)
+linuwu-sense/               ← source vendorizado do módulo Linuwu-Sense (DKMS)
 README.md                   ← documentação do usuário
 CLAUDE.md                   ← este arquivo
 ```
@@ -90,6 +92,9 @@ O fator 0.7 na GPU é intencional: a GPU é menos responsável pelo excesso de T
 - **Máximo entre curvas**: em vez de média, usa `max()` entre todas as curvas ativas — garante que nenhuma fonte de calor seja ignorada
 - **Rollover protection no RAPL**: contador de 32 bits pode fazer wrap-around; o daemon detecta e corrige
 - **Fan=0 ao parar**: tanto via `ExecStop` no service quanto via signal handler, o daemon restaura controle automático do firmware
+- **Início cedo no boot**: o `.service` ordena após `systemd-modules-load.service` + `local-fs.target` (NÃO `multi-user.target`). Usar `multi-user.target` atrasava o controle até a tela de login, deixando as ventoinhas a 100% (modo turbo do firmware) durante todo o boot. Um `ExecStartPre` aguarda o sysfs `fan_speed` aparecer (~5s) caso o módulo carregue com atraso.
+- **DKMS para o módulo**: o `linuwu_sense` é registrado no DKMS pelo `install.sh` para recompilar automaticamente a cada update de kernel (substitui o `make install LLVM=1` manual). Source vendorizado em `linuwu-sense/` com `dkms.conf` próprio; compila com `LLVM=1` (kernel Clang). Assinatura para Secure Boot é auto-detectada (`mokutil --sb-state`) e configurada via `mok_signing_key`/`mok_certificate` no `framework.conf`.
+- **Validação na instalação**: `install.sh` valida shebang (1ª linha = `#!`) + sintaxe Python antes de copiar, e faz auto-teste pós-instalação (`systemctl is-active`). Isso previne o `status=203/EXEC` que ocorria quando o binário instalado tinha uma linha em branco antes do shebang.
 
 ---
 
@@ -103,7 +108,7 @@ O fator 0.7 na GPU é intencional: a GPU é menos responsável pelo excesso de T
 
 ### Média prioridade
 
-- [ ] **CLI de diagnóstico**: script `linuwu-fan-status` que mostra temps, watts e velocidade atual em tempo real (sem precisar parsear journalctl)
+- [x] **CLI de diagnóstico**: `linuwu-fan-ctl status [--watch]` mostra temps, watts e velocidade atual (via `/run/linuwu-fan-control.status`, sem parsear journalctl)
 - [ ] **Modo dry-run**: `--dry-run` para logar o que faria sem escrever no sysfs — útil para testar curvas
 - [ ] **Múltiplos perfis de config**: ex: `[profile:gaming]`, `[profile:silent]`, alternáveis via CLI ou hotkey
 - [ ] **Detecção de AC vs bateria**: aplicar curvas diferentes conforme fonte de energia (`/sys/class/power_supply/AC/online`)

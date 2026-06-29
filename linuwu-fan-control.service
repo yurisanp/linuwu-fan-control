@@ -1,12 +1,21 @@
 [Unit]
 Description=Linuwu Fan Control — controle de ventoinhas por temperatura e watts
 Documentation=https://github.com/0x7375646F/Linuwu-Sense
-After=multi-user.target
-# Aguarda o módulo estar carregado
-After=linuwu_sense.service
+# Inicia o controle o quanto antes no boot: assim que o módulo linuwu_sense
+# e os filesystems locais estiverem prontos.
+#
+# IMPORTANTE: NÃO usar "After=multi-user.target". Isso atrasava o início até a
+# tela de login, deixando as ventoinhas a 100% (modo turbo do firmware) durante
+# todo o boot. Ordenando após o systemd-modules-load + local-fs, o daemon assume
+# o controle logo após o basic.target — bem antes do login.
+After=systemd-modules-load.service local-fs.target
+Wants=systemd-modules-load.service
 
 [Service]
 Type=simple
+# O módulo pode aparecer com um pequeno atraso; aguarda o sysfs do Linuwu-Sense
+# surgir (até ~5s). Sai com 0 mesmo em timeout — o daemon degrada graciosamente.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -e /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed ] && exit 0; sleep 0.1; done; echo "linuwu-fan-control: sysfs fan_speed não apareceu em 5s" >&2; exit 0'
 ExecStart=/usr/local/bin/linuwu-fan-control
 # Restaura ventoinhas para auto ao parar o serviço
 ExecStop=/bin/sh -c 'echo "0,0" > /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed'
