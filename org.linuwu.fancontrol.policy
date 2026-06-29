@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>linuwu-fan-control</vendor>
+  <vendor_url>https://github.com/0x7375646F/Linuwu-Sense</vendor_url>
+
+  <!--
+    Escrita arbitrária (set / enable / disable / reload / apply-profile manual).
+    Pede senha de admin uma vez e mantém em cache por alguns minutos
+    (auth_admin_keep) — usado pela janela de configurações e pelos sliders.
+  -->
+  <action id="org.linuwu.fancontrol.manage">
+    <description>Gerenciar o controle de ventoinhas Linuwu</description>
+    <description xml:lang="en">Manage Linuwu fan control</description>
+    <message>Autenticação necessária para alterar o controle de ventoinhas</message>
+    <message xml:lang="en">Authentication is required to change fan control</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/linuwu-fan-ctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <!--
+    Aplicar um perfil PREDEFINIDO (default/gaming/silent). Conjunto fechado e
+    seguro, instalado por admin → liberado SEM senha para a sessão ativa
+    (allow_active=yes), de modo que a troca manual e a troca automática via
+    Feral GameMode sejam instantâneas (sem prompt no meio de um jogo).
+    O binário linuwu-fan-profile só aceita nomes de perfis já definidos.
+  -->
+  <action id="org.linuwu.fancontrol.apply-profile">
+    <description>Aplicar um perfil predefinido de ventoinhas</description>
+    <description xml:lang="en">Apply a predefined fan profile</description>
+    <message>Aplicar perfil de ventoinhas</message>
+    <message xml:lang="en">Apply fan profile</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/linuwu-fan-profile</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

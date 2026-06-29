@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+linuwu-fan-tray
+───────────────
+Applet de bandeja (KDE Plasma / system tray) para o linuwu-fan-control.
+
+Mostra temperatura, watts e velocidade das ventoinhas em tempo real e permite:
+  - ligar/desligar o controle;
+  - ajustar target_watts e o teto das ventoinhas (controles rápidos);
+  - editar todos os parâmetros (janela de configurações);
+  - trocar entre perfis (default / gaming / silent / …);
+  - trocar automaticamente para o perfil "gaming" quando o Feral GameMode
+    (gamemoderun) entra em ação, revertendo ao perfil anterior ao fim.
+
+Leitura (sem root): /run/linuwu-fan-control.status (JSON) e
+/etc/linuwu-fan-control.conf (INI). Escrita (com root) via pkexec:
+  - perfis  → linuwu-fan-profile <nome>     (polkit sem senha)
+  - demais  → linuwu-fan-ctl set/enable/…   (polkit com senha em cache)
+
+Não tem dependências além do PyQt6 (já usado no KDE/Qt6).
+"""
+
+import os
+import sys
+import json
+import time
+from configparser import ConfigParser
+
+try:
+    from PyQt6.QtCore import Qt, QTimer, QProcess
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction, QFont
+    from PyQt6.QtWidgets import (
+        QApplication, QSystemTrayIcon, QMenu, QWidget, QLabel, QSlider,
+        QCheckBox, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout,
+        QDialog, QLineEdit, QFormLayout, QProgressBar, QMessageBox, QGroupBox,
+        QDialogButtonBox,
+    )
+    from PyQt6.QtDBus import QDBusConnection, QDBusInterface
+except ImportError as e:  # degrada com mensagem clara
+    sys.stderr.write(
+        "linuwu-fan-tray requer PyQt6.\n"
+        "  Instale com:  sudo pacman -S python-pyqt6\n"
+        f"  (erro: {e})\n"
+    )
+    sys.exit(1)
+
+
+# ── Paths / constantes ──────────────────────────────────────────────────────────
+CONFIG_PATH   = "/etc/linuwu-fan-control.conf"
+PROFILES_PATH = "/etc/linuwu-fan-control.profiles.conf"
+STATUS_FILE   = "/run/linuwu-fan-control.status"
+CTL_BIN       = "/usr/local/bin/linuwu-fan-ctl"
+PROFILE_BIN   = "/usr/local/bin/linuwu-fan-profile"
+STALE_SECS    = 15
+POLL_MS       = 2000
+
+GM_SERVICE = "com.feralinteractive.GameMode"
+GM_PATH    = "/com/feralinteractive/GameMode"
+GM_IFACE   = "com.feralinteractive.GameMode"
+
+STATE_DIR  = os.path.expanduser("~/.config/linuwu-fan-control")
+STATE_FILE = os.path.join(STATE_DIR, "tray.ini")
+
+
+# ── Leitura (sem root) ──────────────────────────────────────────────────────────
+
+def read_status():
+    try:
+        with open(STATUS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def read_config():
+    cfg = ConfigParser()
+    cfg.read(CONFIG_PATH)
+    return cfg
+
+
+def profile_names():
+    cfg = ConfigParser()
+    cfg.read(PROFILES_PATH)
+    return [s.split(":", 1)[1].strip()
+            for s in cfg.sections() if s.startswith("profile:")]
+
+
+def _cfg_get(cfg, section, key, default=None):
+    try:
+        return cfg.get(section, key)
+    except Exception:
+        return default
+
+
+# ── Ícone ───────────────────────────────────────────────────────────────────────
+
+def make_icon(active=True):
+    """Ícone temático se existir; senão um fallback desenhado."""
+    for name in ("sensors-fan", "org.kde.plasmasystemmonitor", "temperature-warm", "cpu"):
+        ic = QIcon.fromTheme(name)
+        if not ic.isNull():
+            return ic
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#3daee9") if active else QColor("#888888"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(6, 6, 52, 52)
+    p.setPen(QColor("white"))
+    f = QFont()
+    f.setBold(True)
+    f.setPointSize(26)
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "F")
+    p.end()
+    return QIcon(pm)
+
+
+# ── Persistência de estado da tray ──────────────────────────────────────────────
+
+def load_state():
+    cfg = ConfigParser()
+    cfg.read(STATE_FILE)
+    return {
+        "current_profile": _cfg_get(cfg, "tray", "current_profile", "default"),
+        "gamemode_auto":   _cfg_get(cfg, "tray", "gamemode_auto", "true") == "true",
+    }
+
+
+def save_state(current_profile, gamemode_auto):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        cfg = ConfigParser()
+        cfg["tray"] = {
+            "current_profile": current_profile or "default",
+            "gamemode_auto": "true" if gamemode_auto else "false",
+        }
+        with open(STATE_FILE, "w") as f:
+            cfg.write(f)
+    except OSError:
+        pass
+
+
+# ── Janela de configurações ─────────────────────────────────────────────────────
+
+# (section, key, rótulo) — espelha o PARAM_ORDER do linuwu-fan-ctl
+SETTINGS_FIELDS = [
+    ("general", "poll_interval", "Intervalo de leitura (s)"),
+    ("general", "ramp_step",     "Passo de rampa (%/ciclo)"),
+    ("general", "hysteresis",    "Histerese (%)"),
+    ("power",   "target_watts",  "Meta de watts"),
+    ("limits",  "cpu_fan_min",   "Fan CPU mín (%)"),
+    ("limits",  "cpu_fan_max",   "Fan CPU máx (%)"),
+    ("limits",  "gpu_fan_min",   "Fan GPU mín (%)"),
+    ("limits",  "gpu_fan_max",   "Fan GPU máx (%)"),
+    ("power",    "curve",        "Curva de watts"),
+    ("cpu_temp", "curve",        "Curva temp CPU"),
+    ("gpu_temp", "curve",        "Curva temp GPU"),
+]
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, tray):
+        super().__init__()
+        self.tray = tray
+        self.setWindowTitle("Configurações — linuwu-fan-control")
+        self.edits = {}
+
+        form = QFormLayout()
+        cfg = read_config()
+        for section, key, label in SETTINGS_FIELDS:
+            edit = QLineEdit(_cfg_get(cfg, section, key, ""))
+            self.edits[(section, key)] = edit
+            form.addRow(label, edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Close
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.close)
+
+        root = QVBoxLayout(self)
+        hint = QLabel("Edita /etc/linuwu-fan-control.conf via pkexec. "
+                      "Só os campos alterados são aplicados.")
+        hint.setWordWrap(True)
+        root.addLayout(form)
+        root.addWidget(hint)
+        root.addWidget(buttons)
+
+    def _apply(self):
+        cfg = read_config()
+        changes = []
+        for (section, key), edit in self.edits.items():
+            new = edit.text().strip()
+            old = _cfg_get(cfg, section, key, "")
+            if new != "" and new != old:
+                changes.append((f"{section}.{key}", new))
+        if not changes:
+            self.tray.notify("Configurações", "Nada alterado.")
+            return
+        for full, value in changes:
+            self.tray.enqueue_priv([CTL_BIN, "set", full, value], f"set {full}")
+
+
+# ── Painel de controles rápidos ─────────────────────────────────────────────────
+
+class QuickPanel(QWidget):
+    def __init__(self, tray):
+        super().__init__()
+        self.tray = tray
+        self.setWindowTitle("linuwu-fan-control")
+        self.setWindowFlags(Qt.WindowType.Tool)
+
+        root = QVBoxLayout(self)
+
+        # Leituras ao vivo
+        live = QGroupBox("Estado")
+        grid = QGridLayout(live)
+        self.lbl_cpu = QLabel("CPU —")
+        self.lbl_gpu = QLabel("GPU —")
+        self.bar_cpu = QProgressBar(); self.bar_cpu.setRange(0, 100)
+        self.bar_gpu = QProgressBar(); self.bar_gpu.setRange(0, 100)
+        grid.addWidget(self.lbl_cpu, 0, 0); grid.addWidget(self.bar_cpu, 0, 1)
+        grid.addWidget(self.lbl_gpu, 1, 0); grid.addWidget(self.bar_gpu, 1, 1)
+        root.addWidget(live)
+
+        # Controles
+        ctrl = QGroupBox("Controles rápidos")
+        cl = QVBoxLayout(ctrl)
+
+        self.chk_enabled = QCheckBox("Controle ativo")
+        self.chk_enabled.clicked.connect(self._toggle_enabled)
+        cl.addWidget(self.chk_enabled)
+
+        self.lbl_tw = QLabel("Meta de watts")
+        self.sld_tw = QSlider(Qt.Orientation.Horizontal)
+        self.sld_tw.setRange(20, 120)
+        self.sld_tw.valueChanged.connect(
+            lambda v: self.lbl_tw.setText(f"Meta de watts: {v} W"))
+        self.sld_tw.sliderReleased.connect(self._apply_target_watts)
+        cl.addWidget(self.lbl_tw); cl.addWidget(self.sld_tw)
+
+        self.lbl_fan = QLabel("Teto das ventoinhas")
+        self.sld_fan = QSlider(Qt.Orientation.Horizontal)
+        self.sld_fan.setRange(40, 100)
+        self.sld_fan.valueChanged.connect(
+            lambda v: self.lbl_fan.setText(f"Teto das ventoinhas: {v}%"))
+        self.sld_fan.sliderReleased.connect(self._apply_fan_cap)
+        cl.addWidget(self.lbl_fan); cl.addWidget(self.sld_fan)
+
+        root.addWidget(ctrl)
+
+        btns = QHBoxLayout()
+        b_set = QPushButton("Configurações…")
+        b_set.clicked.connect(self.tray.open_settings)
+        b_close = QPushButton("Fechar")
+        b_close.clicked.connect(self.close)
+        btns.addWidget(b_set); btns.addWidget(b_close)
+        root.addLayout(btns)
+
+    def reload_from_config(self):
+        cfg = read_config()
+        en = _cfg_get(cfg, "general", "enabled", "true")
+        self.chk_enabled.setChecked(str(en).lower() in ("true", "yes", "1"))
+        try:
+            self.sld_tw.setValue(int(float(_cfg_get(cfg, "power", "target_watts", "50"))))
+        except ValueError:
+            pass
+        try:
+            cap = int(float(_cfg_get(cfg, "limits", "cpu_fan_max", "100")))
+            self.sld_fan.setValue(max(40, min(100, cap)))
+        except ValueError:
+            pass
+
+    def update_live(self, data):
+        if not data:
+            self.lbl_cpu.setText("CPU — sem dados")
+            self.lbl_gpu.setText("GPU — sem dados")
+            self.bar_cpu.setValue(0); self.bar_gpu.setValue(0)
+            return
+        ct = data.get("cpu_temp"); gw = data.get("gpu_watts")
+        cw = data.get("cpu_watts"); gt = data.get("gpu_temp")
+        cf = data.get("cpu_fan", 0); gf = data.get("gpu_fan", 0)
+        self.lbl_cpu.setText(
+            f"CPU {ct:.0f}°C {cw:.0f}W" if ct is not None and cw is not None else "CPU —")
+        self.lbl_gpu.setText(
+            f"GPU {gt:.0f}°C {gw:.0f}W" if gt is not None and gw is not None else "GPU —")
+        self.bar_cpu.setValue(int(cf)); self.bar_gpu.setValue(int(gf))
+
+    def _toggle_enabled(self, checked):
+        self.tray.enqueue_priv([CTL_BIN, "enable" if checked else "disable"],
+                               "enable" if checked else "disable")
+
+    def _apply_target_watts(self):
+        self.tray.enqueue_priv(
+            [CTL_BIN, "set", "power.target_watts", str(self.sld_tw.value())],
+            "target_watts")
+
+    def _apply_fan_cap(self):
+        v = str(self.sld_fan.value())
+        self.tray.enqueue_priv([CTL_BIN, "set", "limits.cpu_fan_max", v], "cpu_fan_max")
+        self.tray.enqueue_priv([CTL_BIN, "set", "limits.gpu_fan_max", v], "gpu_fan_max")
+
+
+# ── Tray principal ──────────────────────────────────────────────────────────────
+
+class FanTray:
+    def __init__(self, app):
+        self.app = app
+        st = load_state()
+        self.current_profile = st["current_profile"]
+        self.gamemode_auto   = st["gamemode_auto"]
+
+        self.icon_on  = make_icon(True)
+        self.icon_off = make_icon(False)
+        self.tray = QSystemTrayIcon(self.icon_on)
+        self.tray.setToolTip("linuwu-fan-control")
+
+        self.panel = QuickPanel(self)
+        self.settings_dlg = None
+
+        # Fila de comandos privilegiados (sequencial → evita N diálogos pkexec)
+        self._pq = []
+        self._pq_running = False
+        self._pq_errors = []
+
+        # GameMode
+        self._game_active = False
+        self._prev_profile = self.current_profile
+        self._gm_props = None
+        self._setup_gamemode()
+
+        self._build_menu()
+        self.tray.activated.connect(self._on_activated)
+        self.tray.show()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(POLL_MS)
+        self.tick()
+
+    # ── Menu ────────────────────────────────────────────────────────────────
+    def _build_menu(self):
+        menu = QMenu()
+
+        self.act_state = QAction("…")
+        self.act_state.setEnabled(False)
+        menu.addAction(self.act_state)
+        menu.addSeparator()
+
+        self.act_panel = QAction("Mostrar painel")
+        self.act_panel.triggered.connect(self.toggle_panel)
+        menu.addAction(self.act_panel)
+
+        self.act_enabled = QAction("Controle ativo")
+        self.act_enabled.setCheckable(True)
+        self.act_enabled.triggered.connect(
+            lambda checked: self.enqueue_priv(
+                [CTL_BIN, "enable" if checked else "disable"],
+                "enable" if checked else "disable"))
+        menu.addAction(self.act_enabled)
+
+        # Perfis
+        self.profile_menu = menu.addMenu("Perfil")
+        self.profile_actions = {}
+        self._rebuild_profile_menu()
+
+        self.act_gm = QAction("Auto-perfil no GameMode")
+        self.act_gm.setCheckable(True)
+        self.act_gm.setChecked(self.gamemode_auto)
+        if self._gm_props is None:
+            self.act_gm.setEnabled(False)
+            self.act_gm.setText("Auto-perfil no GameMode (indisponível)")
+        self.act_gm.triggered.connect(self._toggle_gamemode_auto)
+        menu.addAction(self.act_gm)
+
+        menu.addSeparator()
+        act_settings = QAction("Configurações…")
+        act_settings.triggered.connect(self.open_settings)
+        menu.addAction(act_settings)
+
+        act_quit = QAction("Sair")
+        act_quit.triggered.connect(self.app.quit)
+        menu.addAction(act_quit)
+
+        self.tray.setContextMenu(menu)
+
+    def _rebuild_profile_menu(self):
+        self.profile_menu.clear()
+        self.profile_actions = {}
+        names = profile_names()
+        if not names:
+            a = QAction("(nenhum perfil)")
+            a.setEnabled(False)
+            self.profile_menu.addAction(a)
+            return
+        for name in names:
+            a = QAction(name)
+            a.setCheckable(True)
+            a.setChecked(name == self.current_profile)
+            a.triggered.connect(lambda _checked, n=name: self.apply_profile(n))
+            self.profile_menu.addAction(a)
+            self.profile_actions[name] = a
+
+    # ── GameMode ─────────────────────────────────────────────────────────────
+    def _setup_gamemode(self):
+        bus = QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            return
+        self._gm_props = QDBusInterface(
+            GM_SERVICE, GM_PATH, "org.freedesktop.DBus.Properties", bus)
+        # Se o serviço não estiver no bus, marca indisponível (a feature some).
+        if self._gm_client_count() is None:
+            self._gm_props = None
+
+    def _gm_client_count(self):
+        """Nº de jogos ativos no GameMode, ou None se indisponível."""
+        if self._gm_props is None:
+            return None
+        try:
+            reply = self._gm_props.call("Get", GM_IFACE, "ClientCount")
+            if reply is None or reply.errorName():
+                return None
+            args = reply.arguments()
+            if not args:
+                return None
+            val = args[0]
+            if hasattr(val, "variant"):
+                val = val.variant()
+            return int(val)
+        except Exception:
+            return None
+
+    def _toggle_gamemode_auto(self, checked):
+        self.gamemode_auto = checked
+        save_state(self.current_profile, self.gamemode_auto)
+
+    def _check_gamemode(self):
+        if not self.gamemode_auto or self._gm_props is None:
+            return
+        count = self._gm_client_count()
+        if count is None:
+            return
+        active = count > 0
+        if active and not self._game_active:
+            self._game_active = True
+            self._prev_profile = self.current_profile or "default"
+            if "gaming" in profile_names():
+                self.apply_profile("gaming", auto=True)
+        elif not active and self._game_active:
+            self._game_active = False
+            target = self._prev_profile or "default"
+            self.apply_profile(target, auto=True)
+
+    # ── Aplicação de mudanças (pkexec) ───────────────────────────────────────
+    def apply_profile(self, name, auto=False):
+        self.current_profile = name
+        save_state(self.current_profile, self.gamemode_auto)
+        for n, a in self.profile_actions.items():
+            a.setChecked(n == name)
+        label = f"perfil {name}" + (" (GameMode)" if auto else "")
+        self.enqueue_priv([PROFILE_BIN, name], label)
+
+    def enqueue_priv(self, argv, label):
+        self._pq.append((argv, label))
+        self._pump_queue()
+
+    def _pump_queue(self):
+        if self._pq_running or not self._pq:
+            return
+        argv, label = self._pq.pop(0)
+        self._pq_running = True
+        proc = QProcess(self.app)
+
+        def done(code, _status):
+            self._pq_running = False
+            err = bytes(proc.readAllStandardError()).decode(errors="replace").strip()
+            if code != 0:
+                self._pq_errors.append(f"{label}: {err or ('código ' + str(code))}")
+            proc.deleteLater()
+            if self._pq:
+                self._pump_queue()
+            else:
+                self._flush_errors()
+                self.tick()
+
+        proc.finished.connect(done)
+        proc.start("pkexec", argv)
+
+    def _flush_errors(self):
+        if self._pq_errors:
+            self.notify("Falha ao aplicar", "\n".join(self._pq_errors))
+            self._pq_errors = []
+
+    def notify(self, title, message):
+        self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    # ── UI ───────────────────────────────────────────────────────────────────
+    def _on_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.MiddleClick):
+            self.toggle_panel()
+
+    def toggle_panel(self):
+        if self.panel.isVisible():
+            self.panel.hide()
+        else:
+            self.panel.reload_from_config()
+            self.panel.update_live(read_status())
+            self.panel.show()
+            self.panel.raise_()
+            self.panel.activateWindow()
+
+    def open_settings(self):
+        self.settings_dlg = SettingsDialog(self)
+        self.settings_dlg.show()
+        self.settings_dlg.raise_()
+        self.settings_dlg.activateWindow()
+
+    # ── Loop ──────────────────────────────────────────────────────────────────
+    def tick(self):
+        data = read_status()
+        cfg = read_config()
+        enabled = str(_cfg_get(cfg, "general", "enabled", "true")).lower() in ("true", "yes", "1")
+
+        stale = True
+        if data:
+            stale = (time.time() - data.get("ts", 0)) > STALE_SECS
+        running = bool(data) and not stale
+
+        # Ícone + estado
+        self.tray.setIcon(self.icon_on if (running and enabled) else self.icon_off)
+        self.act_enabled.setChecked(enabled)
+
+        if not running:
+            state = "daemon inativo / sem dados"
+            tip = "linuwu-fan-control\nDaemon inativo ou sem dados."
+        else:
+            ct = data.get("cpu_temp"); gt = data.get("gpu_temp")
+            cw = data.get("cpu_watts"); gw = data.get("gpu_watts")
+            cf = data.get("cpu_fan", 0); gf = data.get("gpu_fan", 0)
+            state = "ativo" if enabled else "desativado (firmware)"
+            tip = (
+                f"linuwu-fan-control — {state}\n"
+                f"CPU {self._fmt(ct,'°C')} {self._fmt(cw,'W')}  Fan {cf}%\n"
+                f"GPU {self._fmt(gt,'°C')} {self._fmt(gw,'W')}  Fan {gf}%\n"
+                f"Perfil: {self.current_profile}"
+            )
+        self.act_state.setText(f"● {state}")
+        self.tray.setToolTip(tip)
+
+        if self.panel.isVisible():
+            self.panel.update_live(data)
+
+        self._check_gamemode()
+
+    @staticmethod
+    def _fmt(v, unit):
+        return f"{v:.0f}{unit}" if v is not None else f"—{unit}"
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("linuwu-fan-tray")
+    app.setQuitOnLastWindowClosed(False)  # fechar o painel não encerra o app
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        sys.stderr.write("Bandeja do sistema indisponível — abortando.\n")
+        sys.exit(1)
+
+    FanTray(app)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

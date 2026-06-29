@@ -15,6 +15,7 @@ O objetivo é manter um perfil térmico silencioso e estável, com ventoinhas co
 - Recarrega a configuração automaticamente ao detectar mudanças no arquivo (sem reiniciar o serviço)
 - Persistência via **systemd** com enable/disable sem reboot
 - **Início cedo no boot** — assume o controle logo após o módulo carregar, sem esperar a tela de login (evita ventoinhas a 100% durante todo o boot em modo turbo)
+- **Applet de bandeja (KDE Plasma)** — monitor ao vivo, controles rápidos, perfis e troca automática para *gaming* via Feral GameMode
 - Ao parar o serviço, devolve controle automático ao firmware (`fan=0`)
 
 ---
@@ -130,15 +131,68 @@ gpu_fan_max = 100
 
 ---
 
+## Applet de bandeja (KDE Plasma)
+
+O `linuwu-fan-tray` adiciona um ícone na bandeja do sistema (system tray) com
+monitor ao vivo e controles gráficos. Requer **PyQt6** (`sudo pacman -S python-pyqt6`)
+e inicia sozinho no login (autostart instalado em `/etc/xdg/autostart/`).
+
+- **Tooltip/ícone:** temperatura, watts e % das ventoinhas, atualizados a cada 2s.
+- **Painel (clique):** liga/desliga o controle, slider de `target_watts` e de teto das
+  ventoinhas (aplicados ao soltar o slider).
+- **Menu (botão direito):** perfis, auto-perfil no GameMode, janela de configurações.
+- **Janela de configurações:** edita todos os parâmetros (`general.*`, `power.target_watts`,
+  `limits.*` e curvas).
+
+Iniciar manualmente sem relogar: `linuwu-fan-tray &`.
+
+### Perfis
+
+Perfis são predefinições em `/etc/linuwu-fan-control.profiles.conf` (seções
+`[profile:NOME]`). Os padrões são **default**, **gaming** (resfriamento agressivo) e
+**silent** (mais silencioso). Aplicar um perfil copia seus valores para a config ativa
+e recarrega o daemon.
+
+```bash
+linuwu-fan-ctl list-profiles
+linuwu-fan-profile gaming         # aplica (sem senha — ver abaixo)
+```
+
+### Troca automática no GameMode
+
+Com o **Feral GameMode** instalado, ao iniciar um jogo via `gamemoderun` a tray aplica
+automaticamente o perfil **gaming** e, ao encerrar, volta ao perfil anterior. Pode ser
+ligado/desligado no menu ("Auto-perfil no GameMode").
+
+### Permissões (polkit)
+
+A leitura é feita direto dos arquivos (sem root). A escrita usa **pkexec** com duas
+políticas polkit (`org.linuwu.fancontrol.policy`):
+
+| Ação | Senha |
+|------|-------|
+| Aplicar perfil predefinido (`linuwu-fan-profile`) — manual ou via GameMode | **Não** (conjunto fechado e seguro) |
+| Escrita arbitrária — sliders, configurações, enable/disable (`linuwu-fan-ctl`) | **Sim**, em cache por alguns minutos (`auth_admin_keep`) |
+
+Para exigir senha também nos perfis, troque `yes`→`auth_admin_keep` na ação
+`org.linuwu.fancontrol.apply-profile` do arquivo de política.
+
+---
+
 ## Arquitetura
 
 ```
-linuwu-fan-control          ← daemon principal (Python)
-linuwu-fan-ctl              ← CLI de controle/diagnóstico
-linuwu-fan-control.conf     ← configuração editável pelo usuário
-linuwu-fan-control.service  ← unit systemd (início cedo no boot)
-install.sh                  ← script de instalação (valida + registra DKMS)
-linuwu-sense/               ← source vendorizado do módulo (DKMS)
+linuwu-fan-control            ← daemon principal (Python)
+linuwu-fan-ctl                ← CLI de controle/diagnóstico (+ perfis)
+linuwu-fan-tray               ← applet de bandeja KDE Plasma (PyQt6)
+linuwu-fan-profile            ← wrapper root p/ aplicar perfil (polkit sem senha)
+linuwu-fan-control.conf       ← configuração ativa
+linuwu-fan-control.profiles.conf ← perfis (default/gaming/silent)
+linuwu-fan-control.service    ← unit systemd (início cedo no boot)
+org.linuwu.fancontrol.policy  ← política polkit (pkexec)
+linuwu-fan-tray.desktop       ← autostart + entrada de menu
+install.sh                    ← script de instalação (valida + registra DKMS)
+linuwu-sense/                 ← source vendorizado do módulo (DKMS)
 ```
 
 ### Fluxo do daemon

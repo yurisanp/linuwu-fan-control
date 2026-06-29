@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""
+linuwu-fan-profile — aplica um PERFIL PREDEFINIDO do linuwu-fan-control.
+
+Este binário existe como um *path* separado do linuwu-fan-ctl apenas para ter
+sua própria política polkit (org.linuwu.fancontrol.apply-profile), que permite
+aplicar perfis SEM senha. Por isso ele é deliberadamente restrito:
+
+  - aceita SOMENTE um nome de perfil já definido em
+    /etc/linuwu-fan-control.profiles.conf;
+  - rejeita qualquer entrada que não case com [A-Za-z0-9_-]+ (sem paths, sem
+    injeção de argumentos);
+  - delega a aplicação real ao linuwu-fan-ctl, reaproveitando validação + SIGHUP.
+
+Uso (normalmente via pkexec, a partir da bandeja / GameMode):
+  linuwu-fan-profile <nome>
+  linuwu-fan-profile --list
+"""
+
+import os
+import re
+import sys
+from configparser import ConfigParser
+
+PROFILES_PATH = "/etc/linuwu-fan-control.profiles.conf"
+CTL_PATH      = "/usr/local/bin/linuwu-fan-ctl"
+NAME_RE       = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def profile_names():
+    cfg = ConfigParser()
+    cfg.read(PROFILES_PATH)
+    return [s.split(":", 1)[1].strip()
+            for s in cfg.sections() if s.startswith("profile:")]
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print("Uso: linuwu-fan-profile <nome>\n      linuwu-fan-profile --list")
+        return 0
+
+    if args[0] == "--list":
+        for n in profile_names():
+            print(n)
+        return 0
+
+    name = args[0]
+    if not NAME_RE.match(name):
+        print(f"Nome de perfil inválido: {name!r}", file=sys.stderr)
+        return 2
+
+    names = profile_names()
+    if name not in names:
+        avail = ", ".join(names) or "(nenhum)"
+        print(f"Perfil '{name}' não existe. Disponíveis: {avail}", file=sys.stderr)
+        return 2
+
+    if not os.path.exists(CTL_PATH):
+        print(f"linuwu-fan-ctl não encontrado em {CTL_PATH}", file=sys.stderr)
+        return 1
+
+    # Já rodando como root (via pkexec). Substitui o processo pelo CLI, que faz
+    # a validação por chave e o SIGHUP. exec só retorna em caso de erro.
+    os.execv(CTL_PATH, [CTL_PATH, "apply-profile", name])
+    print("Falha ao executar linuwu-fan-ctl", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

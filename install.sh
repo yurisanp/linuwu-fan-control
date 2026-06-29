@@ -159,6 +159,22 @@ validate_script "$SCRIPT_DIR/linuwu-fan-ctl"
 install -m 755 "$SCRIPT_DIR/linuwu-fan-ctl" /usr/local/bin/linuwu-fan-ctl
 verify_installed /usr/local/bin/linuwu-fan-ctl
 
+# ── 3c. Instala o wrapper de perfil (alvo da política polkit sem senha) ───────
+info "Instalando linuwu-fan-profile em /usr/local/bin/..."
+validate_script "$SCRIPT_DIR/linuwu-fan-profile"
+install -m 755 "$SCRIPT_DIR/linuwu-fan-profile" /usr/local/bin/linuwu-fan-profile
+verify_installed /usr/local/bin/linuwu-fan-profile
+
+# ── 3d. Instala o applet de bandeja (KDE Plasma / system tray) ────────────────
+info "Instalando applet de bandeja em /usr/local/bin/linuwu-fan-tray..."
+validate_script "$SCRIPT_DIR/linuwu-fan-tray"
+install -m 755 "$SCRIPT_DIR/linuwu-fan-tray" /usr/local/bin/linuwu-fan-tray
+verify_installed /usr/local/bin/linuwu-fan-tray
+if ! python3 -c "import PyQt6" 2>/dev/null; then
+    warn "PyQt6 não encontrado — o applet de bandeja precisa dele para rodar."
+    warn "Instale com: sudo pacman -S python-pyqt6   (o daemon e o CLI funcionam sem ele)"
+fi
+
 # ── 4. Instala configuração (não sobrescreve se já existir) ───────────────────
 if [[ -f /etc/linuwu-fan-control.conf ]]; then
     warn "Configuração já existe em /etc/linuwu-fan-control.conf — mantendo a existente."
@@ -168,6 +184,26 @@ else
     info "Instalando configuração em /etc/linuwu-fan-control.conf..."
     install -m 644 "$SCRIPT_DIR/linuwu-fan-control.conf" /etc/linuwu-fan-control.conf
 fi
+
+# ── 4b. Instala perfis (não sobrescreve se já existir) ────────────────────────
+if [[ -f /etc/linuwu-fan-control.profiles.conf ]]; then
+    warn "Perfis já existem em /etc/linuwu-fan-control.profiles.conf — mantendo os existentes."
+    install -m 644 "$SCRIPT_DIR/linuwu-fan-control.profiles.conf" /etc/linuwu-fan-control.profiles.conf.new
+else
+    info "Instalando perfis em /etc/linuwu-fan-control.profiles.conf..."
+    install -m 644 "$SCRIPT_DIR/linuwu-fan-control.profiles.conf" /etc/linuwu-fan-control.profiles.conf
+fi
+
+# ── 4c. Instala política polkit (escrita via pkexec) ──────────────────────────
+info "Instalando política polkit..."
+install -m 644 "$SCRIPT_DIR/org.linuwu.fancontrol.policy" \
+    /usr/share/polkit-1/actions/org.linuwu.fancontrol.policy
+
+# ── 4d. Instala autostart + entrada de menu do applet ─────────────────────────
+info "Instalando autostart e entrada de menu do applet..."
+install -d /etc/xdg/autostart /usr/share/applications
+install -m 644 "$SCRIPT_DIR/linuwu-fan-tray.desktop" /etc/xdg/autostart/linuwu-fan-tray.desktop
+install -m 644 "$SCRIPT_DIR/linuwu-fan-tray.desktop" /usr/share/applications/linuwu-fan-tray.desktop
 
 # ── 5. Instala serviço systemd ────────────────────────────────────────────────
 info "Instalando serviço systemd..."
@@ -208,6 +244,10 @@ echo "  Ver configuração      :  linuwu-fan-ctl get"
 echo "  Ajustar parâmetro     :  sudo linuwu-fan-ctl set power.target_watts 60"
 echo "  Desativar controle    :  sudo linuwu-fan-ctl disable"
 echo "  Reativar controle     :  sudo linuwu-fan-ctl enable"
+echo ""
+echo "  Applet de bandeja     :  linuwu-fan-tray &   (inicia sozinho no próximo login)"
+echo "  Listar perfis         :  linuwu-fan-ctl list-profiles"
+echo "  Aplicar perfil        :  linuwu-fan-profile gaming"
 echo ""
 echo "  Logs do serviço       :  sudo journalctl -fu linuwu-fan-control"
 echo "  Parar (fan=auto)      :  sudo systemctl stop linuwu-fan-control"

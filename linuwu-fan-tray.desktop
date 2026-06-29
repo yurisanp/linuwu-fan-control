@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Linuwu Fan Control (bandeja)
+Name[pt_BR]=Linuwu Fan Control (bandeja)
+GenericName=Controle de ventoinhas
+Comment=Applet de bandeja para controlar as ventoinhas (Acer Predator / Linuwu-Sense)
+Comment[pt_BR]=Applet de bandeja para controlar as ventoinhas (Acer Predator / Linuwu-Sense)
+Exec=/usr/local/bin/linuwu-fan-tray
+Icon=sensors-fan
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+StartupNotify=false
+X-KDE-autostart-phase=2
+X-GNOME-Autostart-enabled=true

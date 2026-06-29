@@ -11,6 +11,8 @@ Uso:
   linuwu-fan-ctl set SECTION.KEY V  → atualizar parâmetro (root)
   linuwu-fan-ctl reload             → forçar reload (SIGHUP)
   linuwu-fan-ctl enable / disable   → ativar/desativar controle
+  linuwu-fan-ctl list-profiles      → listar perfis disponíveis
+  linuwu-fan-ctl apply-profile NOME → aplicar um perfil (root)
 """
 
 import argparse
@@ -25,10 +27,11 @@ import time
 from configparser import ConfigParser
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-CONFIG_PATH  = "/etc/linuwu-fan-control.conf"
-STATUS_FILE  = "/run/linuwu-fan-control.status"
-PID_FILE     = "/run/linuwu-fan-control.pid"
-STALE_SECS   = 15
+CONFIG_PATH   = "/etc/linuwu-fan-control.conf"
+PROFILES_PATH = "/etc/linuwu-fan-control.profiles.conf"
+STATUS_FILE   = "/run/linuwu-fan-control.status"
+PID_FILE      = "/run/linuwu-fan-control.pid"
+STALE_SECS    = 15
 
 # ── Ordem de exibição dos parâmetros na TUI ────────────────────────────────────
 PARAM_ORDER = [
@@ -184,6 +187,65 @@ def update_config_key(section, key, value):
     with open(tmp, "w") as f:
         f.writelines(out)
     os.replace(tmp, CONFIG_PATH)
+
+
+# ── Perfis ─────────────────────────────────────────────────────────────────────
+#
+# Perfis são "templates" guardados em PROFILES_PATH como seções [profile:NOME].
+# Cada chave usa o formato canônico "section.key = value" (mesma convenção do
+# `set`). Aplicar um perfil = copiar seus valores para as seções vivas do
+# CONFIG_PATH e disparar UM SIGHUP. O daemon não lê PROFILES_PATH.
+
+def read_profiles():
+    """Retorna ConfigParser dos perfis (vazio se o arquivo não existir)."""
+    cfg = ConfigParser()
+    cfg.read(PROFILES_PATH)
+    return cfg
+
+
+def list_profile_names():
+    """Nomes de todos os perfis definidos (seções [profile:NOME])."""
+    cfg = read_profiles()
+    return [s.split(":", 1)[1].strip()
+            for s in cfg.sections() if s.startswith("profile:")]
+
+
+def apply_profile(name):
+    """
+    Aplica o perfil [profile:NAME] copiando cada 'section.key = value' para o
+    CONFIG_PATH. Valida TODOS os valores antes de escrever qualquer um.
+    Faz 1 SIGHUP no fim. Retorna (True, msg) ou (False, msg). Requer root.
+    """
+    profiles = read_profiles()
+    sec_name = f"profile:{name}"
+    if not profiles.has_section(sec_name):
+        avail = ", ".join(list_profile_names()) or "(nenhum)"
+        return False, f"Perfil '{name}' não encontrado. Disponíveis: {avail}"
+
+    pending = []
+    for raw_key, value in profiles.items(sec_name):
+        if "." not in raw_key:
+            return False, (f"Perfil '{name}': chave inválida '{raw_key}' "
+                           f"(esperado section.key, ex: power.target_watts)")
+        section, key = raw_key.split(".", 1)
+        ok, err = validate_value(section, key, value)
+        if not ok:
+            return False, f"Perfil '{name}': {err}"
+        pending.append((section, key, value))
+
+    if not pending:
+        return False, f"Perfil '{name}' está vazio."
+
+    for section, key, value in pending:
+        try:
+            update_config_key(section, key, value)
+        except ValueError as e:
+            return False, str(e)
+        except (PermissionError, OSError):
+            return False, f"Sem permissão para escrever em {CONFIG_PATH} (requer root)."
+
+    ok2, rmsg = send_sighup()
+    return True, f"Perfil '{name}' aplicado ({len(pending)} parâmetros) — {rmsg}"
 
 
 # ── Formatação ─────────────────────────────────────────────────────────────────
@@ -467,6 +529,11 @@ def _fmt_status_plain(data, cfg):
 
 def cmd_status(args):
     cfg = read_config()
+    if getattr(args, "json", False):
+        data = read_status() or {}
+        data.setdefault("target_watts", cfg.get("power", "target_watts", fallback=None))
+        print(json.dumps(data))
+        return
     if args.watch:
         try:
             while True:
@@ -481,6 +548,17 @@ def cmd_status(args):
 
 def cmd_get(args):
     cfg = read_config()
+    if getattr(args, "json", False):
+        out = {sec: dict(cfg.items(sec)) for sec in cfg.sections()}
+        if args.key:
+            parts = args.key.split(".", 1)
+            if len(parts) != 2:
+                sys.exit("Formato: SECTION.KEY  (ex: power.target_watts)")
+            sec, key = parts
+            print(json.dumps(out.get(sec, {}).get(key)))
+        else:
+            print(json.dumps(out))
+        return
     if args.key:
         parts = args.key.split(".", 1)
         if len(parts) != 2:
@@ -496,6 +574,30 @@ def cmd_get(args):
             for k, v in cfg.items(sec):
                 print(f"  {k:<20} = {v}")
             print()
+
+
+def cmd_list_profiles(args):
+    names = list_profile_names()
+    if getattr(args, "json", False):
+        print(json.dumps(names))
+        return
+    if not names:
+        print(f"(nenhum perfil definido em {PROFILES_PATH})")
+        return
+    for n in names:
+        print(n)
+
+
+def cmd_apply_profile(args):
+    if os.geteuid() != 0:
+        sys.exit(
+            "Permissão negada: 'apply-profile' requer root.\n"
+            f"  Dica: sudo linuwu-fan-ctl apply-profile {args.name}"
+        )
+    ok, msg = apply_profile(args.name)
+    print(msg)
+    if not ok:
+        sys.exit(1)
 
 
 def cmd_set(args):
@@ -559,11 +661,13 @@ def main():
 
     p_status = sub.add_parser("status", help="Mostrar status atual")
     p_status.add_argument("--watch", action="store_true", help="Atualizar a cada 2s (Ctrl+C para sair)")
+    p_status.add_argument("--json", action="store_true", help="Saída JSON (machine-readable)")
     p_status.set_defaults(func=cmd_status)
 
     p_get = sub.add_parser("get", help="Ler valores de configuração")
     p_get.add_argument("key", nargs="?", metavar="SECTION.KEY",
                        help="Ex: power.target_watts (omita para mostrar tudo)")
+    p_get.add_argument("--json", action="store_true", help="Saída JSON (machine-readable)")
     p_get.set_defaults(func=cmd_get)
 
     p_set = sub.add_parser("set", help="Atualizar um parâmetro (requer root)")
@@ -578,6 +682,14 @@ def main():
     p_enable.set_defaults(func=cmd_enable)
     p_disable = sub.add_parser("disable", help="Desativar controle (general.enabled=false, requer root)")
     p_disable.set_defaults(func=cmd_disable)
+
+    p_lprof = sub.add_parser("list-profiles", help="Listar perfis disponíveis")
+    p_lprof.add_argument("--json", action="store_true", help="Saída JSON")
+    p_lprof.set_defaults(func=cmd_list_profiles)
+
+    p_aprof = sub.add_parser("apply-profile", help="Aplicar um perfil predefinido (requer root)")
+    p_aprof.add_argument("name", metavar="NOME", help="Nome do perfil (ver list-profiles)")
+    p_aprof.set_defaults(func=cmd_apply_profile)
 
     args = parser.parse_args()
 
