@@ -52,7 +52,7 @@ O script de instalação:
 O módulo de kernel **Linuwu-Sense** precisa ser recompilado a cada atualização de kernel. Em vez de rodar `make install LLVM=1` manualmente toda vez, o `install.sh` registra o módulo no **DKMS**, que o recompila sozinho via hook do pacman sempre que o kernel muda.
 
 - O source do módulo é **vendorizado** em [`linuwu-sense/`](linuwu-sense/) (autocontido no repositório), com seu próprio [`dkms.conf`](linuwu-sense/dkms.conf).
-- A compilação usa `LLVM=1` (kernels CachyOS/zen são compilados com Clang).
+- A toolchain é detectada por kernel: `LLVM=1` só é usado se o `.config` do kernel alvo for Clang (`linux-cachyos`); `linux-cachyos-lts` e `linux` (Arch) são GCC e compilam sem `LLVM=1`.
 - **Secure Boot**: o instalador detecta automaticamente (`mokutil --sb-state`) e, se ativo, configura o DKMS para assinar o módulo com a chave MOK em `~/module-signing/` (`MOK.priv` + `MOK.der`). Sem Secure Boot, nenhuma assinatura é necessária.
 
 ```bash

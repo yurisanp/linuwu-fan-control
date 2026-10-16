@@ -16,6 +16,7 @@
  #include <linux/module.h>
  #include <linux/init.h>
  #include <linux/types.h>
+ #include <linux/string.h>
  #include <linux/dmi.h>
  #include <linux/backlight.h>
  #include <linux/leds.h>
@@ -488,6 +489,12 @@ enum acer_wmi_predator_v4_oc {
     .four_zone_kb = 1,
  };
  
+ static struct quirk_entry quirk_acer_predator_pt316_51s = {
+    .turbo = 1,
+    .predator_v4 = 1,
+    .four_zone_kb = 1,
+ };
+
  static struct quirk_entry quirk_acer_nitro_an16_41 = {
     .nitro_v4 = 1,
     .four_zone_kb = 1,
@@ -795,6 +802,15 @@ enum acer_wmi_predator_v4_oc {
             DMI_MATCH(DMI_PRODUCT_NAME, "Predator PHN16-72"),
         },
         .driver_data = &quirk_acer_predator_phn16_72,
+    },
+     {
+        .callback = dmi_matched,
+        .ident = "Acer Predator PT316-51s",
+        .matches = {
+            DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
+            DMI_MATCH(DMI_PRODUCT_NAME, "Predator PT316-51s"),
+        },
+        .driver_data = &quirk_acer_predator_pt316_51s,
     },
      {
          .callback = dmi_matched,
@@ -3299,7 +3315,7 @@ enum acer_wmi_predator_v4_oc {
      char *token;
      char* input_ptr = input;
      size_t len = min(count, sizeof(input) - 1);
-     strncpy(input, buf, len);
+     memcpy(input, buf, len);
  
      if(input[len-1] == '\n'){
          input[len-1] = '\0';
@@ -3750,7 +3766,7 @@ enum acer_wmi_predator_v4_oc {
      char *input_ptr = input_buf;
      size_t len = min(count, sizeof(input_buf) - 1);
  
-     strncpy(input_buf, buf, len);
+     memcpy(input_buf, buf, len);
  
      if(input_buf[len-1] == '\n'){
          input_buf[len-1] = '\0';
@@ -3923,7 +3939,7 @@ enum acer_wmi_predator_v4_oc {
      struct per_zone_color colors;
      char *input_ptr = str_buf;
      len = min(count, sizeof(str_buf) - 1);
-     strncpy(str_buf, buf, len);
+     memcpy(str_buf, buf, len);
      if(str_buf[len-1] == '\n'){
          str_buf[len-1] = '\0';
      } else {
